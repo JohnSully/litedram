@@ -215,6 +215,10 @@ class Multiplexer(Module, AutoCSR):
             settings.timing.tCCD if settings.timing.tCCD is not None else 0)
         self.comb += twtrcon.valid.eq(choose_req.accept() & choose_req.write())
 
+        # tRTW timing (read to write delay)
+        self.submodules.trtwcon = trtwcon = tXXDController(settings.phy.read_latency)
+        self.comb += trtwcon.valid.eq(choose_req.accept() & choose_req.read())
+
         # Read/write turnaround
         read_available = Signal()
         write_available = Signal()
@@ -322,12 +326,17 @@ class Multiplexer(Module, AutoCSR):
             )
         )
         fsm.act("WTR",
+            choose_req.want_reads.eq(1),
             If(twtrcon.ready,
                 NextState("READ")
             )
         )
-        # TODO: reduce this, actual limit is around (cl+1)/nphases
-        fsm.delayed_enter("RTW", "WRITE", settings.phy.read_latency-1)
+        fsm.act("RTW",
+            choose_req.want_writes.eq(1),
+            If(trtwcon.ready,
+                NextState("WRITE")
+            )
+        )
 
         if settings.with_bandwidth:
             data_width = settings.phy.dfi_databits*settings.phy.nphases

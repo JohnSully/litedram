@@ -1,17 +1,20 @@
-"""Built In Self Test (BIST) modules for testing liteDRAM functionality."""
+"""Built In Self Test (BIST) modules for testing LiteDRAM functionality."""
 
 from functools import reduce
 from operator import xor
 
 from migen import *
-from migen.genlib.cdc import PulseSynchronizer, BusSynchronizer
+from migen.genlib.cdc import MultiReg
+from migen.genlib.cdc import PulseSynchronizer
+from migen.genlib.cdc import BusSynchronizer
 
 from litex.soc.interconnect.csr import *
 
+from litedram.common import LiteDRAMNativePort
+from litedram.frontend.axi import LiteDRAMAXIPort
 from litedram.frontend.dma import LiteDRAMDMAWriter, LiteDRAMDMAReader
 
 
-@CEInserter()
 class LFSR(Module):
     """Linear-Feedback Shift Register to generate a pseudo-random sequence.
 
@@ -26,10 +29,10 @@ class LFSR(Module):
 
     Attributes
     ----------
-    o : in
+    o : out
         Output data
     """
-    def __init__(self, n_out, n_state=31, taps=[27, 30]):
+    def __init__(self, n_out, n_state, taps):
         self.o = Signal(n_out)
 
         # # #
@@ -48,7 +51,6 @@ class LFSR(Module):
         ]
 
 
-@CEInserter()
 class Counter(Module):
     """Simple incremental counter.
 
@@ -59,7 +61,7 @@ class Counter(Module):
 
     Attributes
     ----------
-    o : in
+    o : out
         Output data
     """
     def __init__(self, n_out):
@@ -70,25 +72,77 @@ class Counter(Module):
         self.sync += self.o.eq(self.o + 1)
 
 
+@CEInserter()
+class Generator(Module):
+    """Address/Data Generator.
+
+    Parameters
+    ----------
+    n_out : int
+        Width of the output data signal.
+
+    Attributes
+    ----------
+    random_enable : in
+        Enable Random (LFSR)
+
+    o : out
+        Output data
+    """
+    def __init__(self, n_out, n_state, taps):
+        self.random_enable = Signal()
+        self.o = Signal(n_out)
+
+        # # #
+
+        lfsr = LFSR(n_out, n_state, taps)
+        count = Counter(n_out)
+        self.submodules += lfsr, count
+
+        self.comb += \
+            If(self.random_enable,
+                self.o.eq(lfsr.o)
+            ).Else(
+                self.o.eq(count.o)
+            )
+
+
+def get_ashift_awidth(dram_port):
+    if isinstance(dram_port, LiteDRAMNativePort):
+        ashift = log2_int(dram_port.data_width//8)
+        awidth = dram_port.address_width + ashift
+    elif isinstance(dram_port, LiteDRAMAXIPort):
+        ashift = log2_int(dram_port.data_width//8)
+        awidth = dram_port.address_width
+    else:
+        raise NotImplementedError
+    return ashift, awidth
+
+
 @ResetInserter()
 class _LiteDRAMBISTGenerator(Module):
-    def __init__(self, dram_port, random):
-        ashift = log2_int(dram_port.dw//8)
-        awidth = dram_port.aw + ashift
+    def __init__(self, dram_port):
+        ashift, awidth = get_ashift_awidth(dram_port)
         self.start = Signal()
         self.done = Signal()
         self.base = Signal(awidth)
         self.length = Signal(awidth)
+        self.random = Signal()
         self.ticks = Signal(32)
 
         # # #
 
-        gen_cls = LFSR if random else Counter
-        gen = gen_cls(min(dram_port.dw, 32)) # FIXME: remove lfsr limitation
-        dma = LiteDRAMDMAWriter(dram_port)
-        self.submodules += dma, gen
+        # data / address generators
+        data_gen = Generator(31, n_state=31, taps=[27, 30]) # PRBS31
+        addr_gen = CEInserter()(Counter(awidth))
+        self.submodules += data_gen, addr_gen
+        self.comb += data_gen.random_enable.eq(self.random)
 
-        cmd_counter = Signal(dram_port.aw, reset_less=True)
+        # dma
+        dma = LiteDRAMDMAWriter(dram_port)
+        self.submodules += dma
+
+        cmd_counter = Signal(dram_port.address_width, reset_less=True)
 
         fsm = FSM(reset_state="IDLE")
         self.submodules += fsm
@@ -102,7 +156,8 @@ class _LiteDRAMBISTGenerator(Module):
         fsm.act("RUN",
             dma.sink.valid.eq(1),
             If(dma.sink.ready,
-                gen.ce.eq(1),
+                data_gen.ce.eq(1),
+                addr_gen.ce.eq(1),
                 NextValue(cmd_counter, cmd_counter + 1),
                 If(cmd_counter == (self.length[ashift:] - 1),
                     NextState("DONE")
@@ -113,10 +168,13 @@ class _LiteDRAMBISTGenerator(Module):
         fsm.act("DONE",
             self.done.eq(1)
         )
-        self.comb += [
-            dma.sink.address.eq(self.base[ashift:] + cmd_counter),
-            dma.sink.data.eq(gen.o)
-        ]
+        if isinstance(dram_port, LiteDRAMNativePort): # addressing in dwords
+            self.comb += dma.sink.address.eq(self.base[ashift:] + addr_gen.o)
+        elif isinstance(dram_port, LiteDRAMAXIPort):  # addressing in bytes
+            self.comb += dma.sink.address[ashift:].eq(self.base[ashift:] + addr_gen.o)
+        else:
+            raise NotImplementedError
+        self.comb += dma.sink.data.eq(data_gen.o)
 
 
 class LiteDRAMBISTGenerator(Module, AutoCSR):
@@ -126,96 +184,119 @@ class LiteDRAMBISTGenerator(Module, AutoCSR):
     ----------
     reset : in
         Reset the module.
+
     start : in
         Start the generation.
-
-    base : in
-        DRAM address to start from.
-    length : in
-        Number of DRAM words to write.
 
     done : out
         The module has completed writing the pattern.
 
+    base : in
+        DRAM address to start from.
+
+    length : in
+        Number of DRAM words to write.
+
+    random : in
+        Enable random data (LFSR)
+
     ticks : out
         Duration of the generation.
     """
-    def __init__(self, dram_port, random=True):
-        ashift = log2_int(dram_port.dw//8)
-        awidth = dram_port.aw + ashift
+    def __init__(self, dram_port):
+        ashift, awidth = get_ashift_awidth(dram_port)
         self.reset = CSR()
         self.start = CSR()
         self.done = CSRStatus()
         self.base = CSRStorage(awidth)
         self.length = CSRStorage(awidth)
+        self.random = CSRStorage()
         self.ticks = CSRStatus(32)
 
         # # #
 
-        cd = dram_port.cd
+        clock_domain = dram_port.clock_domain
 
-        core = _LiteDRAMBISTGenerator(dram_port, random)
-        core = ClockDomainsRenamer(cd)(core)
+        core = _LiteDRAMBISTGenerator(dram_port)
+        core = ClockDomainsRenamer(clock_domain)(core)
         self.submodules += core
 
-        reset_sync = PulseSynchronizer("sys", cd)
-        start_sync = PulseSynchronizer("sys", cd)
-        self.submodules += reset_sync, start_sync
-        self.comb += [
-            reset_sync.i.eq(self.reset.re),
-            core.reset.eq(reset_sync.o),
+        if clock_domain != "sys":
+            reset_sync = PulseSynchronizer("sys", clock_domain)
+            start_sync = PulseSynchronizer("sys", clock_domain)
+            self.submodules += reset_sync, start_sync
+            self.comb += [
+                reset_sync.i.eq(self.reset.re),
+                core.reset.eq(reset_sync.o),
 
-            start_sync.i.eq(self.start.re),
-            core.start.eq(start_sync.o)
-        ]
+                start_sync.i.eq(self.start.re),
+                core.start.eq(start_sync.o)
+            ]
 
-        done_sync = BusSynchronizer(1, cd, "sys")
-        self.submodules += done_sync
-        self.comb += [
-            done_sync.i.eq(core.done),
-            self.done.status.eq(done_sync.o)
-        ]
+            done_sync = BusSynchronizer(1, clock_domain, "sys")
+            self.submodules += done_sync
+            self.comb += [
+                done_sync.i.eq(core.done),
+                self.done.status.eq(done_sync.o)
+            ]
 
-        base_sync = BusSynchronizer(awidth, "sys", cd)
-        length_sync = BusSynchronizer(awidth, "sys", cd)
-        self.submodules += base_sync, length_sync
-        self.comb += [
-            base_sync.i.eq(self.base.storage),
-            core.base.eq(base_sync.o),
+            base_sync = BusSynchronizer(awidth, "sys", clock_domain)
+            length_sync = BusSynchronizer(awidth, "sys", clock_domain)
+            self.submodules += base_sync, length_sync
+            self.comb += [
+                base_sync.i.eq(self.base.storage),
+                core.base.eq(base_sync.o),
 
-            length_sync.i.eq(self.length.storage),
-            core.length.eq(length_sync.o)
-        ]
+                length_sync.i.eq(self.length.storage),
+                core.length.eq(length_sync.o)
+            ]
 
-        ticks_sync = BusSynchronizer(32, cd, "sys")
-        self.submodules += ticks_sync
-        self.comb += [
-            ticks_sync.i.eq(core.ticks),
-            self.ticks.status.eq(ticks_sync.o)
-        ]
+            self.specials += MultiReg(self.random.storage, core.random, clock_domain)
+
+            ticks_sync = BusSynchronizer(32, clock_domain, "sys")
+            self.submodules += ticks_sync
+            self.comb += [
+                ticks_sync.i.eq(core.ticks),
+                self.ticks.status.eq(ticks_sync.o)
+            ]
+        else:
+            self.comb += [
+                core.reset.eq(self.reset.re),
+                core.start.eq(self.start.re),
+                self.done.status.eq(core.done),
+                core.base.eq(self.base.storage),
+                core.length.eq(self.length.storage),
+                core.random.eq(self.random.storage),
+                self.ticks.status.eq(core.ticks)
+            ]
 
 
 @ResetInserter()
 class _LiteDRAMBISTChecker(Module, AutoCSR):
-    def __init__(self, dram_port, random):
-        ashift = log2_int(dram_port.dw//8)
-        awidth = dram_port.aw + ashift
+    def __init__(self, dram_port):
+        ashift, awidth = get_ashift_awidth(dram_port)
         self.start = Signal()
         self.done = Signal()
         self.base = Signal(awidth)
         self.length = Signal(awidth)
+        self.random = Signal()
         self.ticks = Signal(32)
         self.errors = Signal(32)
 
         # # #
 
-        gen_cls = LFSR if random else Counter
-        gen = gen_cls(min(dram_port.dw, 32)) # FIXME: remove lfsr limitation
+        # data / address generators
+        data_gen = Generator(31, n_state=31, taps=[27, 30]) # PRBS31
+        addr_gen = CEInserter()(Counter(awidth))
+        self.submodules += data_gen, addr_gen
+        self.comb += data_gen.random_enable.eq(self.random)
+
+        # dma
         dma = LiteDRAMDMAReader(dram_port)
-        self.submodules += dma, gen
+        self.submodules += dma
 
         # address
-        cmd_counter = Signal(dram_port.aw, reset_less=True)
+        cmd_counter = Signal(dram_port.address_width, reset_less=True)
 
         cmd_fsm = FSM(reset_state="IDLE")
         self.submodules += cmd_fsm
@@ -228,6 +309,7 @@ class _LiteDRAMBISTChecker(Module, AutoCSR):
         cmd_fsm.act("RUN",
             dma.sink.valid.eq(1),
             If(dma.sink.ready,
+                addr_gen.ce.eq(1),
                 NextValue(cmd_counter, cmd_counter + 1),
                 If(cmd_counter == (self.length[ashift:] - 1),
                     NextState("DONE")
@@ -235,10 +317,15 @@ class _LiteDRAMBISTChecker(Module, AutoCSR):
             )
         )
         cmd_fsm.act("DONE")
-        self.comb += dma.sink.address.eq(self.base[ashift:] + cmd_counter)
+        if isinstance(dram_port, LiteDRAMNativePort): # addressing in dwords
+            self.comb += dma.sink.address.eq(self.base[ashift:] + addr_gen.o)
+        elif isinstance(dram_port, LiteDRAMAXIPort):  # addressing in bytes
+            self.comb += dma.sink.address[ashift:].eq(self.base[ashift:] + addr_gen.o)
+        else:
+            raise NotImplementedError
 
         # data
-        data_counter = Signal(dram_port.aw, reset_less=True)
+        data_counter = Signal(dram_port.address_width, reset_less=True)
 
         data_fsm = FSM(reset_state="IDLE")
         self.submodules += data_fsm
@@ -253,9 +340,9 @@ class _LiteDRAMBISTChecker(Module, AutoCSR):
         data_fsm.act("RUN",
             dma.source.ready.eq(1),
             If(dma.source.valid,
-                gen.ce.eq(1),
+                data_gen.ce.eq(1),
                 NextValue(data_counter, data_counter + 1),
-                If(dma.source.data != gen.o,
+                If(dma.source.data != data_gen.o,
                     NextValue(self.errors, self.errors + 1)
                 ),
                 If(data_counter == (self.length[ashift:] - 1),
@@ -279,13 +366,16 @@ class LiteDRAMBISTChecker(Module, AutoCSR):
     start : in
         Start the checking
 
+    done : out
+        The module has completed checking
+
     base : in
         DRAM address to start from.
     length : in
         Number of DRAM words to check.
 
-    done : out
-        The module has completed checking
+    random : in
+        Enable random data (LFSR)
 
     ticks: out
         Duration of the check.
@@ -293,64 +383,78 @@ class LiteDRAMBISTChecker(Module, AutoCSR):
     errors : out
         Number of DRAM words which don't match.
     """
-    def __init__(self, dram_port, random=True):
-        ashift = log2_int(dram_port.dw//8)
-        awidth = dram_port.aw + ashift
+    def __init__(self, dram_port):
+        ashift, awidth = get_ashift_awidth(dram_port)
         self.reset = CSR()
         self.start = CSR()
+        self.done = CSRStatus()
         self.base = CSRStorage(awidth)
         self.length = CSRStorage(awidth)
-        self.done = CSRStatus()
+        self.random = CSRStorage()
         self.ticks = CSRStatus(32)
         self.errors = CSRStatus(32)
 
         # # #
 
-        cd = dram_port.cd
+        clock_domain = dram_port.clock_domain
 
-        core = _LiteDRAMBISTChecker(dram_port, random)
-        core = ClockDomainsRenamer(cd)(core)
+        core = _LiteDRAMBISTChecker(dram_port)
+        core = ClockDomainsRenamer(clock_domain)(core)
         self.submodules += core
 
-        reset_sync = PulseSynchronizer("sys", cd)
-        start_sync = PulseSynchronizer("sys", cd)
-        self.submodules += reset_sync, start_sync
-        self.comb += [
-            reset_sync.i.eq(self.reset.re),
-            core.reset.eq(reset_sync.o),
+        if clock_domain != "sys":
+            reset_sync = PulseSynchronizer("sys", clock_domain)
+            start_sync = PulseSynchronizer("sys", clock_domain)
+            self.submodules += reset_sync, start_sync
+            self.comb += [
+                reset_sync.i.eq(self.reset.re),
+                core.reset.eq(reset_sync.o),
 
-            start_sync.i.eq(self.start.re),
-            core.start.eq(start_sync.o)
-        ]
+                start_sync.i.eq(self.start.re),
+                core.start.eq(start_sync.o)
+            ]
 
-        done_sync = BusSynchronizer(1, cd, "sys")
-        self.submodules += done_sync
-        self.comb += [
-            done_sync.i.eq(core.done),
-            self.done.status.eq(done_sync.o)
-        ]
+            done_sync = BusSynchronizer(1, clock_domain, "sys")
+            self.submodules += done_sync
+            self.comb += [
+                done_sync.i.eq(core.done),
+                self.done.status.eq(done_sync.o)
+            ]
 
-        base_sync = BusSynchronizer(awidth, "sys", cd)
-        length_sync = BusSynchronizer(awidth, "sys", cd)
-        self.submodules += base_sync, length_sync
-        self.comb += [
-            base_sync.i.eq(self.base.storage),
-            core.base.eq(base_sync.o),
+            base_sync = BusSynchronizer(awidth, "sys", clock_domain)
+            length_sync = BusSynchronizer(awidth, "sys", clock_domain)
+            self.submodules += base_sync, length_sync
+            self.comb += [
+                base_sync.i.eq(self.base.storage),
+                core.base.eq(base_sync.o),
 
-            length_sync.i.eq(self.length.storage),
-            core.length.eq(length_sync.o)
-        ]
+                length_sync.i.eq(self.length.storage),
+                core.length.eq(length_sync.o)
+            ]
 
-        ticks_sync = BusSynchronizer(32, cd, "sys")
-        self.submodules += ticks_sync
-        self.comb += [
-            ticks_sync.i.eq(core.ticks),
-            self.ticks.status.eq(ticks_sync.o)
-        ]
+            self.specials += MultiReg(self.random.storage, core.random, clock_domain)
 
-        errors_sync = BusSynchronizer(32, cd, "sys")
-        self.submodules += errors_sync
-        self.comb += [
-            errors_sync.i.eq(core.errors),
-            self.errors.status.eq(errors_sync.o)
-        ]
+            ticks_sync = BusSynchronizer(32, clock_domain, "sys")
+            self.submodules += ticks_sync
+            self.comb += [
+                ticks_sync.i.eq(core.ticks),
+                self.ticks.status.eq(ticks_sync.o)
+            ]
+
+            errors_sync = BusSynchronizer(32, clock_domain, "sys")
+            self.submodules += errors_sync
+            self.comb += [
+                errors_sync.i.eq(core.errors),
+                self.errors.status.eq(errors_sync.o)
+            ]
+        else:
+            self.comb += [
+                core.reset.eq(self.reset.re),
+                core.start.eq(self.start.re),
+                self.done.status.eq(core.done),
+                core.base.eq(self.base.storage),
+                core.length.eq(self.length.storage),
+                core.random.eq(self.random.storage),
+                self.ticks.status.eq(core.ticks),
+                self.errors.status.eq(core.errors)
+            ]

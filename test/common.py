@@ -26,8 +26,12 @@ class DRAMMemory:
         for _ in range(depth-len(init)):
             self.mem.append(0)
 
+    def show_content(self):
+        for addr in range(self.depth):
+            print("0x{:08x}: 0x{:08x}".format(addr, self.mem[addr]))
+
     @passive
-    def read_generator(self, dram_port):
+    def read_handler(self, dram_port):
         address = 0
         pending = 0
         yield dram_port.cmd.ready.eq(0)
@@ -42,7 +46,7 @@ class DRAMMemory:
                 pending = 0
             elif (yield dram_port.cmd.valid):
                 pending = not (yield dram_port.cmd.we)
-                address = (yield dram_port.cmd.adr)
+                address = (yield dram_port.cmd.addr)
                 if pending:
                     yield dram_port.cmd.ready.eq(1)
                     yield
@@ -50,13 +54,15 @@ class DRAMMemory:
             yield
 
     @passive
-    def write_generator(self, dram_port):
+    def write_handler(self, dram_port):
         address = 0
         pending = 0
         yield dram_port.cmd.ready.eq(0)
         while True:
             yield dram_port.wdata.ready.eq(0)
             if pending:
+                while (yield dram_port.wdata.valid) == 0:
+                    yield
                 yield dram_port.wdata.ready.eq(1)
                 yield
                 self.mem[address%self.depth] = (yield dram_port.wdata.data) # TODO manage we
@@ -66,32 +72,9 @@ class DRAMMemory:
                 yield
             elif (yield dram_port.cmd.valid):
                 pending = (yield dram_port.cmd.we)
-                address = (yield dram_port.cmd.adr)
+                address = (yield dram_port.cmd.addr)
                 if pending:
                     yield dram_port.cmd.ready.eq(1)
                     yield
                     yield dram_port.cmd.ready.eq(0)
             yield
-
-
-class BISTDriver:
-    def __init__(self, module):
-        self.module = module
-
-    def reset(self):
-        yield self.module.reset.eq(1)
-        yield
-        yield self.module.reset.eq(0)
-        yield
-
-    def run(self, base, length):
-        yield self.module.base.eq(base)
-        yield self.module.length.eq(length)
-        yield self.module.start.eq(1)
-        yield
-        yield self.module.start.eq(0)
-        yield
-        while((yield self.module.done) == 0):
-            yield
-        if hasattr(self.module, "errors"):
-            self.errors = (yield self.module.errors)

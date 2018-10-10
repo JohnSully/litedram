@@ -1,15 +1,16 @@
 from functools import reduce
-from operator import or_, and_
+from operator import add, or_, and_
 
 from migen import *
 from migen.genlib.roundrobin import *
+from migen.genlib.coding import Decoder
 
 from litex.soc.interconnect import stream
 from litex.soc.interconnect.csr import AutoCSR
 
 from litedram.common import *
 from litedram.core.perf import Bandwidth
-
+import math
 
 class _CommandChooser(Module):
     def __init__(self, requests):
@@ -20,6 +21,7 @@ class _CommandChooser(Module):
 
         a = len(requests[0].a)
         ba = len(requests[0].ba)
+
         # cas/ras/we are 0 when valid is inactive
         self.cmd = cmd = stream.Endpoint(cmd_request_rw_layout(a, ba))
 
@@ -61,8 +63,24 @@ class _CommandChooser(Module):
                 If(cmd.valid & cmd.ready & (arbiter.grant == i),
                     request.ready.eq(1)
                 )
-        self.comb += arbiter.ce.eq(cmd.ready)
+	# Arbitrate if we're accepting commands, *or* if we are not but the current selection is not valid
+	#	This is to ensure that a valid command is selected when cmd.ready goes high
+        self.comb += arbiter.ce.eq(cmd.ready | ~cmd.valid)
 
+    # helpers
+    def accept(self):
+        return self.cmd.valid & self.cmd.ready
+
+    def activate(self):
+        return self.cmd.ras & ~self.cmd.cas & ~self.cmd.we
+
+    def write(self):
+        return self.cmd.is_write
+
+    def read(self):
+        return self.cmd.is_read
+
+(STEER_NOP, STEER_CMD, STEER_REQ, STEER_REFRESH) = range(4)
 
 class _Steerer(Module):
     def __init__(self, commands, dfi):
@@ -76,30 +94,66 @@ class _Steerer(Module):
             if not hasattr(cmd, "valid"):
                 return 0
             else:
-                return cmd.valid & getattr(cmd, attr)
+                return cmd.valid & cmd.ready & getattr(cmd, attr)
 
-        for phase, sel in zip(dfi.phases, self.sel):
-            self.comb += [
-                phase.cke.eq(1),
-                phase.cs_n.eq(0)
-            ]
-            if hasattr(phase, "odt"):
-                self.comb += phase.odt.eq(1)
+        for i, (phase, sel) in enumerate(zip(dfi.phases, self.sel)):
+            nranks = len(phase.cs_n)
+            rankbits = log2_int(nranks)
             if hasattr(phase, "reset_n"):
                 self.comb += phase.reset_n.eq(1)
+            self.comb += phase.cke.eq(Replicate(Signal(reset=1), nranks))
+            if hasattr(phase, "odt"):
+                # FIXME: add dynamic drive for multi-rank (will be needed for high frequencies)
+                self.comb += phase.odt.eq(Replicate(Signal(reset=1), nranks))
+            if rankbits:
+                rank_decoder = Decoder(nranks)
+                self.submodules += rank_decoder
+                self.comb += rank_decoder.i.eq((Array(cmd.ba[-rankbits:] for cmd in commands)[sel]))
+                if i == 0: # Select all ranks on refresh.
+                    self.sync += If(sel == STEER_REFRESH, phase.cs_n.eq(0)).Else(phase.cs_n.eq(~rank_decoder.o))
+                else:
+                    self.sync += phase.cs_n.eq(~rank_decoder.o)
+                self.sync += phase.bank.eq(Array(cmd.ba[:-rankbits] for cmd in commands)[sel])
+            else:
+                self.sync += phase.cs_n.eq(0)
+                self.sync += phase.bank.eq(Array(cmd.ba[:] for cmd in commands)[sel])
+
             self.sync += [
                 phase.address.eq(Array(cmd.a for cmd in commands)[sel]),
-                phase.bank.eq(Array(cmd.ba for cmd in commands)[sel]),
-                phase.cas_n.eq(~Array(cmd.cas for cmd in commands)[sel]),
-                phase.ras_n.eq(~Array(cmd.ras for cmd in commands)[sel]),
-                phase.we_n.eq(~Array(cmd.we for cmd in commands)[sel])
+                phase.cas_n.eq(~Array(valid_and(cmd, "cas") for cmd in commands)[sel]),
+                phase.ras_n.eq(~Array(valid_and(cmd, "ras") for cmd in commands)[sel]),
+                phase.we_n.eq(~Array(valid_and(cmd, "we") for cmd in commands)[sel])
             ]
+
             rddata_ens = Array(valid_and(cmd, "is_read") for cmd in commands)
             wrdata_ens = Array(valid_and(cmd, "is_write") for cmd in commands)
             self.sync += [
                 phase.rddata_en.eq(rddata_ens[sel]),
                 phase.wrdata_en.eq(wrdata_ens[sel])
             ]
+
+
+class tFAWController(Module):
+    def __init__(self, tfaw):
+        self.valid = valid = Signal()
+        self.ready = ready = Signal(reset=1)
+        ready.attr.add("no_retiming")
+
+        # # #
+
+        if tfaw is not None:
+            count = Signal(max=max(tfaw, 2))
+            window = Signal(tfaw)
+            self.sync += window.eq(Cat(valid, window))
+            self.comb += count.eq(reduce(add, [window[i] for i in range(tfaw)]))
+            self.sync += \
+                If(count < 4,
+                    If(count == 3,
+                        ready.eq(~valid)
+                    ).Else(
+                        ready.eq(1)
+                    )
+                )
 
 
 class Multiplexer(Module, AutoCSR):
@@ -112,9 +166,9 @@ class Multiplexer(Module, AutoCSR):
             with_bandwidth=False):
         assert(settings.phy.nphases == len(dfi.phases))
 
-        # Forward Declares
-        activate_allowed = Signal(reset=1)
-        
+        ras_allowed = Signal(reset=1)
+        cas_allowed = Signal(reset=1)
+
         # Command choosing
         requests = [bm.cmd for bm in bank_machines]
         self.submodules.choose_cmd = choose_cmd = _CommandChooser(requests)
@@ -122,75 +176,48 @@ class Multiplexer(Module, AutoCSR):
         if settings.phy.nphases == 1:
             self.comb += [
                 choose_cmd.want_cmds.eq(1),
-                choose_cmd.want_activates(activate_allowed),
-                choose_req.want_cmds.eq(1)
+                choose_cmd.want_activates.eq(ras_allowed),
+                choose_req.want_cmds.eq(1),
+                choose_req.want_activates.eq(ras_allowed),
             ]
 
         # Command steering
         nop = Record(cmd_request_layout(settings.geom.addressbits,
-                                        settings.geom.bankbits))
+                                        log2_int(len(bank_machines))))
         # nop must be 1st
         commands = [nop, choose_cmd.cmd, choose_req.cmd, refresher.cmd]
-        (STEER_NOP, STEER_CMD, STEER_REQ, STEER_REFRESH) = range(4)
         steerer = _Steerer(commands, dfi)
         self.submodules += steerer
 
-        # tRRD Command Timing
-        tRRD = settings.timing.tRRD
-        trrd_allowed = Signal(reset=1)
-        activate_count = Signal(max=tRRD)
-        is_act_cmd = Signal()
-        self.comb += is_act_cmd.eq(choose_cmd.cmd.ras & ~choose_cmd.cmd.cas & ~choose_cmd.cmd.we)
-        self.sync += \
-            If(choose_cmd.cmd.ready & choose_cmd.cmd.valid & is_act_cmd,
-                activate_count.eq(tRRD-1)
-            ).Elif(~activate_allowed,
-                activate_count.eq(activate_count-1)
-            )
-        self.comb += trrd_allowed.eq(activate_count == 0)
-        
-        # tFAW Command Timing
-        tfaw = settings.timing.tFAW
-        tfaw_allowed = Signal(reset=1)
-        if tfaw is not None:
-            tfaw_count = Signal(max=tfaw)
-            tfaw_window = Signal(tfaw)
-            self.sync += tfaw_window.eq(Cat((is_act_cmd & choose_cmd.cmd.ready & choose_cmd.cmd.valid), tfaw_window))
-            for i in range(tfaw):
-                next_tfaw_count = Signal(max=tfaw)
-                self.comb += next_tfaw_count.eq(tfaw_count + tfaw_window[i])
-                tfaw_count = next_tfaw_count
-            self.comb += If(tfaw_count >=4, tfaw_allowed.eq(0))
+        # tRRD timing (Row to Row delay)
+        self.submodules.trrdcon = trrdcon = tXXDController(settings.timing.tRRD)
+        self.comb += trrdcon.valid.eq(choose_cmd.accept() & choose_cmd.activate())
 
-        self.comb += activate_allowed.eq(trrd_allowed & tfaw_allowed)
-        self.comb += [bm.activate_allowed.eq(activate_allowed) for bm in bank_machines]
-        
-        # CAS to CAS
-        cas = choose_req.cmd.valid & choose_req.cmd.ready & (choose_req.cmd.is_read | choose_req.cmd.is_write)
-        cas_allowed = Signal(reset=1)
-        tccd =  settings.timing.tCCD
-        if tccd is not None:
-            cas_count = Signal(max=tccd+1)
-            self.sync += \
-                If(cas,
-                    cas_count.eq(tccd-1)
-                ).Elif(~cas_allowed,
-                    cas_count.eq(cas_count-1)
-                )
-            self.comb += cas_allowed.eq(cas_count == 0)
-        self.comb += [bm.cas_allowed.eq(cas_allowed) for bm in bank_machines]
+        # tFAW timing (Four Activate Window)
+        self.submodules.tfawcon = tfawcon = tFAWController(settings.timing.tFAW)
+        self.comb += tfawcon.valid.eq(choose_cmd.accept() & choose_cmd.activate())
 
-        # tWTR timing
-        tWTR = settings.timing.tWTR + settings.timing.tCCD # tWTR begins after the transfer is complete, tccd accounts for this
-        wtr_allowed = Signal(reset=1)
-        wtr_count = Signal(max=tWTR)
-        self.sync += [
-            If(choose_req.cmd.ready & choose_req.cmd.valid & choose_req.cmd.is_write,
-                wtr_count.eq(tWTR-1)
-            ).Elif(wtr_count != 0,
-                wtr_count.eq(wtr_count-1)
-            )
-        ]
+        # RAS control
+        self.comb += ras_allowed.eq(trrdcon.ready & tfawcon.ready)
+
+        # tCCD timing (Column to Column delay)
+        self.submodules.tccdcon = tccdcon = tXXDController(settings.timing.tCCD)
+        self.comb += tccdcon.valid.eq(choose_req.accept() & (choose_req.write() | choose_req.read()))
+
+        # CAS control
+        self.comb += cas_allowed.eq(tccdcon.ready)
+
+        # tWTR timing (Write to Read delay)
+        write_latency = math.ceil(settings.phy.cwl / settings.phy.nphases)
+        self.submodules.twtrcon = twtrcon = tXXDController(
+            settings.timing.tWTR + write_latency +
+            # tCCD must be added since tWTR begins after the transfer is complete
+            settings.timing.tCCD if settings.timing.tCCD is not None else 0)
+        self.comb += twtrcon.valid.eq(choose_req.accept() & choose_req.write())
+
+        # tRTW timing (read to write delay)
+        self.submodules.trtwcon = trtwcon = tXXDController(settings.phy.read_latency)
+        self.comb += trtwcon.valid.eq(choose_req.accept() & choose_req.read())
 
         # Read/write turnaround
         read_available = Signal()
@@ -261,9 +288,9 @@ class Multiplexer(Module, AutoCSR):
         fsm.act("READ",
             read_time_en.eq(1),
             choose_req.want_reads.eq(1),
-            choose_cmd.want_activates.eq(activate_allowed),
-            choose_cmd.cmd.ready.eq(~is_act_cmd | activate_allowed),
-            choose_req.cmd.ready.eq(1),
+            choose_cmd.want_activates.eq(ras_allowed),
+            choose_cmd.cmd.ready.eq(~choose_cmd.activate() | ras_allowed),
+            choose_req.cmd.ready.eq(cas_allowed),
             steerer_sel(steerer, "read"),
             If(write_available,
                 # TODO: switch only after several cycles of ~read_available?
@@ -278,9 +305,9 @@ class Multiplexer(Module, AutoCSR):
         fsm.act("WRITE",
             write_time_en.eq(1),
             choose_req.want_writes.eq(1),
-            choose_cmd.want_activates.eq(activate_allowed),
-            choose_cmd.cmd.ready.eq(~is_act_cmd | activate_allowed),
-            choose_req.cmd.ready.eq(1),
+            choose_cmd.want_activates.eq(ras_allowed),
+            choose_cmd.cmd.ready.eq(~choose_cmd.activate() | ras_allowed),
+            choose_req.cmd.ready.eq(cas_allowed),
             steerer_sel(steerer, "write"),
             If(read_available,
                 If(~write_available | max_write_time,
@@ -299,12 +326,17 @@ class Multiplexer(Module, AutoCSR):
             )
         )
         fsm.act("WTR",
-            If(wtr_count == 0,
+            choose_req.want_reads.eq(1),
+            If(twtrcon.ready,
                 NextState("READ")
             )
         )
-        # TODO: reduce this, actual limit is around (cl+1)/nphases
-        fsm.delayed_enter("RTW", "WRITE", settings.phy.read_latency-1)
+        fsm.act("RTW",
+            choose_req.want_writes.eq(1),
+            If(trtwcon.ready,
+                NextState("WRITE")
+            )
+        )
 
         if settings.with_bandwidth:
             data_width = settings.phy.dfi_databits*settings.phy.nphases
